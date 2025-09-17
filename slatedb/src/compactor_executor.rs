@@ -1,16 +1,16 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::mem;
 use std::sync::atomic::{self, AtomicBool};
 use std::sync::Arc;
 
 use chrono::TimeDelta;
-use futures::future::join_all;
+use futures::future::{join, join_all};
 use parking_lot::Mutex;
 use tokio::task::JoinHandle;
 
 use crate::clock::SystemClock;
-use crate::compactor::WorkerToOrchestratorMsg;
-use crate::compactor::WorkerToOrchestratorMsg::CompactionFinished;
+use crate::compactor::CompactorMessage;
+use crate::compactor::CompactorMessage::CompactionFinished;
 use crate::config::CompactorOptions;
 use crate::db_state::{SortedRun, SsTableHandle, SsTableId};
 use crate::error::SlateDBError;
@@ -23,7 +23,7 @@ use crate::sst_iter::{SstIterator, SstIteratorOptions};
 use crate::tablestore::TableStore;
 
 use crate::compactor::stats::CompactionStats;
-use crate::utils::{spawn_bg_task, IdGenerator};
+use crate::utils::{build_concurrent, compute_max_parallel, spawn_bg_task, IdGenerator};
 use log::{debug, error};
 use tracing::instrument;
 use uuid::Uuid;
@@ -80,7 +80,7 @@ impl TokioCompactionExecutor {
     pub(crate) fn new(
         handle: tokio::runtime::Handle,
         options: Arc<CompactorOptions>,
-        worker_tx: tokio::sync::mpsc::UnboundedSender<WorkerToOrchestratorMsg>,
+        worker_tx: tokio::sync::mpsc::UnboundedSender<CompactorMessage>,
         table_store: Arc<TableStore>,
         rand: Arc<DbRand>,
         stats: Arc<CompactionStats>,
@@ -123,7 +123,7 @@ struct TokioCompactionTask {
 pub(crate) struct TokioCompactionExecutorInner {
     options: Arc<CompactorOptions>,
     handle: tokio::runtime::Handle,
-    worker_tx: tokio::sync::mpsc::UnboundedSender<WorkerToOrchestratorMsg>,
+    worker_tx: tokio::sync::mpsc::UnboundedSender<CompactorMessage>,
     table_store: Arc<TableStore>,
     tasks: Arc<Mutex<HashMap<u32, TokioCompactionTask>>>,
     rand: Arc<DbRand>,
@@ -144,24 +144,35 @@ impl TokioCompactionExecutorInner {
             eager_spawn: true,
         };
 
-        let mut l0_iters = VecDeque::new();
-        for l0 in compaction.ssts.iter() {
-            let maybe_iter =
-                SstIterator::new_borrowed(.., l0, self.table_store.clone(), sst_iter_options)
-                    .await?;
-            if let Some(iter) = maybe_iter {
-                l0_iters.push_back(iter);
-            }
-        }
-        let l0_merge_iter = MergeIterator::new(l0_iters).await?.with_dedup(false);
+        let max_parallel = compute_max_parallel(compaction.ssts.len(), &compaction.sorted_runs, 4);
+        // L0 (borrowed)
+        let l0_iters_futures = build_concurrent(compaction.ssts.iter(), max_parallel, |h| {
+            SstIterator::new_borrowed(
+                .., // full range for compaction or your range
+                h,
+                self.table_store.clone(),
+                sst_iter_options,
+            )
+        });
 
-        let mut sr_iters = VecDeque::new();
-        for sr in compaction.sorted_runs.iter() {
-            let iter =
-                SortedRunIterator::new_borrowed(.., sr, self.table_store.clone(), sst_iter_options)
-                    .await?;
-            sr_iters.push_back(iter);
-        }
+        // SR (borrowed)
+        let sr_iters_futures =
+            build_concurrent(compaction.sorted_runs.iter(), max_parallel, |sr| async {
+                SortedRunIterator::new_borrowed(
+                    .., // full range for compaction or your range
+                    sr,
+                    self.table_store.clone(),
+                    sst_iter_options,
+                )
+                .await
+                .map(Some)
+            });
+
+        let (l0_iters_res, sr_iters_res) = join(l0_iters_futures, sr_iters_futures).await;
+        let l0_iters = l0_iters_res?;
+        let sr_iters = sr_iters_res?;
+
+        let l0_merge_iter = MergeIterator::new(l0_iters).await?.with_dedup(false);
         let sr_merge_iter = MergeIterator::new(sr_iters).await?.with_dedup(false);
 
         let merge_iter = MergeIterator::new([l0_merge_iter, sr_merge_iter])
@@ -203,7 +214,7 @@ impl TokioCompactionExecutorInner {
                 // not already an error (i.e. if the DB is not already shut down).
                 #[allow(clippy::disallowed_methods)]
                 self.worker_tx
-                    .send(WorkerToOrchestratorMsg::CompactionProgress {
+                    .send(CompactorMessage::CompactionProgress {
                         id: compaction.id,
                         bytes_processed: all_iter.total_bytes_processed(),
                     })

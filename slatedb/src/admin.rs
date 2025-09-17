@@ -2,13 +2,14 @@ use crate::checkpoint::{Checkpoint, CheckpointCreateResult};
 use crate::clock::SystemClock;
 use crate::config::{CheckpointOptions, GarbageCollectorOptions};
 use crate::db::builder::GarbageCollectorBuilder;
+use crate::dispatcher::MessageDispatcher;
 use crate::error::SlateDBError;
 use crate::manifest::store::{ManifestStore, StoredManifest};
 
 use crate::clone;
 use crate::object_stores::{ObjectStoreType, ObjectStores};
 use crate::rand::DbRand;
-use crate::utils::IdGenerator;
+use crate::utils::{IdGenerator, WatchableOnceCell};
 use fail_parallel::FailPointRegistry;
 use object_store::path::Path;
 use object_store::ObjectStore;
@@ -17,6 +18,7 @@ use std::error::Error;
 use std::ops::RangeBounds;
 use std::sync::Arc;
 use std::time::Duration;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use uuid::Uuid;
@@ -48,6 +50,7 @@ impl Admin {
         let manifest_store = ManifestStore::new(
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.system_clock.clone(),
         );
         let id_manifest = if let Some(id) = maybe_id {
             manifest_store
@@ -72,6 +75,7 @@ impl Admin {
         let manifest_store = ManifestStore::new(
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.system_clock.clone(),
         );
         let manifests = manifest_store.list_manifests(range).await?;
         Ok(serde_json::to_string(&manifests)?)
@@ -82,6 +86,7 @@ impl Admin {
         let manifest_store = ManifestStore::new(
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.system_clock.clone(),
         );
         let (_, manifest) = manifest_store.read_latest_manifest().await?;
         Ok(manifest.core.checkpoints)
@@ -125,7 +130,6 @@ impl Admin {
         cancellation_token: CancellationToken,
     ) -> Result<(), Box<dyn Error>> {
         let tracker = TaskTracker::new();
-        let ct = cancellation_token.clone();
         let gc = GarbageCollectorBuilder::new(
             self.path.clone(),
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
@@ -133,10 +137,18 @@ impl Admin {
         .with_system_clock(self.system_clock.clone())
         .with_wal_object_store(self.object_stores.store_of(ObjectStoreType::Wal).clone())
         .with_options(gc_opts)
-        .with_cancellation_token(ct)
         .build();
 
-        let jh = tracker.spawn(async move { gc.run_async_task().await });
+        let (_, rx) = mpsc::unbounded_channel();
+        let mut gc_dispatcher = MessageDispatcher::new(
+            Box::new(gc),
+            rx,
+            self.system_clock.clone(),
+            cancellation_token,
+            WatchableOnceCell::new(),
+        );
+
+        let jh = tracker.spawn(async move { gc_dispatcher.run().await });
         tracker.close();
         tracker.wait().await;
         jh.await
@@ -188,6 +200,7 @@ impl Admin {
         let manifest_store = Arc::new(ManifestStore::new(
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.system_clock.clone(),
         ));
         manifest_store
             .validate_no_wal_object_store_configured()
@@ -215,6 +228,7 @@ impl Admin {
         let manifest_store = Arc::new(ManifestStore::new(
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.system_clock.clone(),
         ));
         let mut stored_manifest = StoredManifest::load(manifest_store).await?;
         stored_manifest
@@ -241,6 +255,7 @@ impl Admin {
         let manifest_store = Arc::new(ManifestStore::new(
             &self.path,
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
+            self.system_clock.clone(),
         ));
         let mut stored_manifest = StoredManifest::load(manifest_store).await?;
         stored_manifest
@@ -309,6 +324,7 @@ impl Admin {
             self.object_stores.store_of(ObjectStoreType::Main).clone(),
             parent_checkpoint,
             Arc::new(FailPointRegistry::new()),
+            self.system_clock.clone(),
             self.rand.clone(),
         )
         .await?;

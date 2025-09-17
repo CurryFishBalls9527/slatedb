@@ -85,5 +85,24 @@ jobs:
             cargo publish
           fi
 
-      - name: Publish website
-        uses: ./.github/workflows/release-website.yaml
+      - name: Create Go module tag
+        run: |
+          TAG="slatedb-go/go/v${{ github.event.inputs.version }}"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git ls-remote --tags origin "${TAG}" | grep -q "refs/tags/${TAG}$"; then
+            echo "✔ ${TAG} already exists, skipping"
+          else
+            git tag -a "${TAG}" -m "Release Go module ${TAG}"
+            git push origin "${TAG}"
+          fi
+
+  website:
+    name: Deploy website
+    needs: release
+    uses: ./.github/workflows/release-website.yaml
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    secrets: inherit

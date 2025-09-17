@@ -198,7 +198,7 @@ fn test_dst_nightly() -> Result<(), Error> {
             let runtime = build_runtime(rand.seed());
             let system_clock = Arc::new(MockSystemClock::new());
             let logical_clock = Arc::new(MockLogicalClock::new());
-            let duration = DstDuration::WallClock(std::time::Duration::from_secs(720)); // 12 minutes
+            let duration = DstDuration::WallClock(std::time::Duration::from_secs(900)); // 15 minutes
             runtime.block_on(async move {
                 let span = tracing::info_span!("run_simulation", core = core, seed = seed);
                 let _enter = span.enter();
@@ -215,9 +215,19 @@ fn test_dst_nightly() -> Result<(), Error> {
         });
         handles.push(handle);
     }
-    for (core, handle) in handles.into_iter().enumerate() {
-        let result = handle.join().expect("join failed");
-        info!("simulation result [core={}, result={:?}]", core, result);
-    }
+    let failed = handles
+        .into_iter()
+        .enumerate()
+        .map(|(core, handle)| {
+            let result = handle.join();
+            if result.is_err() {
+                error!("simulation failed [core={}, result={:?}]", core, result);
+            } else {
+                info!("simulation passed [core={}, result={:?}]", core, result);
+            }
+            result
+        })
+        .any(|result| result.is_err());
+    assert!(!failed, "one or more DSTs failed");
     Ok(())
 }

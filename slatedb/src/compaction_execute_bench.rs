@@ -17,7 +17,7 @@ use ulid::Ulid;
 use crate::bytes_generator::OrderedBytesGenerator;
 use crate::clock::{DefaultSystemClock, SystemClock};
 use crate::compactor::stats::CompactionStats;
-use crate::compactor::WorkerToOrchestratorMsg;
+use crate::compactor::CompactorMessage;
 use crate::compactor_executor::{CompactionExecutor, CompactionJob, TokioCompactionExecutor};
 use crate::compactor_state::{Compaction, SourceId};
 use crate::config::{CompactorOptions, CompressionCodec};
@@ -324,11 +324,15 @@ impl CompactionExecuteBench {
             table_store.clone(),
             self.rand.clone(),
             stats.clone(),
-            Arc::new(DefaultSystemClock::new()),
+            self.system_clock.clone(),
         );
         let os = self.object_store.clone();
         info!("load compaction job");
-        let manifest_store = Arc::new(ManifestStore::new(&self.path, os.clone()));
+        let manifest_store = Arc::new(ManifestStore::new(
+            &self.path,
+            os.clone(),
+            self.system_clock.clone(),
+        ));
         let manifest = StoredManifest::load(manifest_store).await?;
 
         let job = match &compaction {
@@ -357,7 +361,7 @@ impl CompactionExecuteBench {
         #[allow(clippy::disallowed_methods)]
         tokio::task::spawn_blocking(move || executor.start_compaction(job));
         while let Some(msg) = rx.recv().await {
-            if let WorkerToOrchestratorMsg::CompactionFinished { id: _, result } = msg {
+            if let CompactorMessage::CompactionFinished { id: _, result } = msg {
                 match result {
                     Ok(_) => {
                         let elapsed_ms = self

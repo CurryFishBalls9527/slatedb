@@ -190,6 +190,9 @@ pub(crate) enum SlateDBError {
 
     #[error("invalid object store URL. url=`{0}`")]
     InvalidObjectStoreURL(String, #[source] url::ParseError),
+
+    #[error("transaction conflict")]
+    TransactionConflict,
 }
 
 impl From<std::io::Error> for SlateDBError {
@@ -334,6 +337,10 @@ impl Error {
         self.source = Some(source);
         self
     }
+
+    pub fn kind(&self) -> &ErrorKind {
+        &self.kind
+    }
 }
 
 impl From<SlateDBError> for Error {
@@ -410,6 +417,7 @@ impl From<SlateDBError> for Error {
             SlateDBError::InvalidObjectStoreURL(_, err) => {
                 Error::configuration(msg).with_source(Box::new(err))
             }
+            SlateDBError::TransactionConflict => Error::operation(msg),
         }
     }
 }

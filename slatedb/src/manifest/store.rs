@@ -1,5 +1,5 @@
 use crate::checkpoint::Checkpoint;
-use crate::clock::{DefaultSystemClock, SystemClock};
+use crate::clock::SystemClock;
 use crate::config::CheckpointOptions;
 use crate::db_state::CoreDbState;
 use crate::error::SlateDBError;
@@ -551,15 +551,7 @@ pub(crate) struct ManifestStore {
 }
 
 impl ManifestStore {
-    pub(crate) fn new(root_path: &Path, object_store: Arc<dyn ObjectStore>) -> Self {
-        Self::new_with_clock(
-            root_path,
-            object_store,
-            Arc::new(DefaultSystemClock::default()),
-        )
-    }
-
-    pub(crate) fn new_with_clock(
+    pub(crate) fn new(
         root_path: &Path,
         object_store: Arc<dyn ObjectStore>,
         clock: Arc<dyn SystemClock>,
@@ -577,9 +569,17 @@ impl ManifestStore {
 
     async fn write_manifest(&self, id: u64, manifest: &Manifest) -> Result<(), SlateDBError> {
         let manifest_path = &self.get_manifest_path(id);
+        self.write_manifest_in_object_store(manifest_path, manifest)
+            .await
+    }
 
+    async fn write_manifest_in_object_store(
+        &self,
+        path: &Path,
+        manifest: &Manifest,
+    ) -> Result<(), SlateDBError> {
         self.object_store
-            .put_if_not_exists(manifest_path, self.codec.encode(manifest))
+            .put_if_not_exists(path, self.codec.encode(manifest))
             .await
             .map_err(|err| {
                 if let AlreadyExists { path: _, source: _ } = err {
@@ -588,7 +588,6 @@ impl ManifestStore {
                     SlateDBError::from(err)
                 }
             })?;
-
         Ok(())
     }
 
@@ -769,6 +768,8 @@ mod tests {
     use crate::error;
     use crate::error::SlateDBError;
     use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
+    use crate::retrying_object_store::RetryingObjectStore;
+    use crate::test_utils::FlakyObjectStore;
     use chrono::Timelike;
     use object_store::memory::InMemory;
     use object_store::path::Path;
@@ -999,7 +1000,11 @@ mod tests {
     async fn test_should_read_specific_manifest() {
         // Given
         let os = Arc::new(InMemory::new());
-        let ms = Arc::new(ManifestStore::new(&Path::from(ROOT), os.clone()));
+        let ms = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            os.clone(),
+            Arc::new(DefaultSystemClock::new()),
+        ));
         let state = CoreDbState::new();
         let mut sm = StoredManifest::create_new_db(ms.clone(), state.clone())
             .await
@@ -1014,6 +1019,30 @@ mod tests {
 
         // Then:
         assert_eq!(1, manifest.core.checkpoints.len());
+    }
+
+    #[tokio::test]
+    async fn test_retry_write_manifest_on_timeout() {
+        // Given a flaky store that times out on the first write
+        let base = Arc::new(InMemory::new());
+        let flaky = Arc::new(FlakyObjectStore::new(base.clone(), 1));
+        let retrying = Arc::new(RetryingObjectStore::new(flaky.clone()));
+        let ms = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            retrying.clone(),
+            Arc::new(DefaultSystemClock::new()),
+        ));
+
+        // When creating a new DB (initial manifest write under retry)
+        let core = CoreDbState::new();
+        let _sm = StoredManifest::create_new_db(ms.clone(), core.clone())
+            .await
+            .unwrap();
+
+        // Then: a retry happened and the manifest matches input
+        assert!(flaky.put_attempts() >= 2);
+        let written = ms.try_read_manifest(1).await.unwrap().unwrap();
+        assert_eq!(written, super::super::Manifest::initial(core));
     }
 
     #[tokio::test]
@@ -1085,7 +1114,11 @@ mod tests {
 
     fn new_memory_manifest_store() -> Arc<ManifestStore> {
         let os = Arc::new(InMemory::new());
-        Arc::new(ManifestStore::new(&Path::from(ROOT), os.clone()))
+        Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            os.clone(),
+            Arc::new(DefaultSystemClock::new()),
+        ))
     }
 
     fn new_checkpoint(manifest_id: u64) -> Checkpoint {
@@ -1321,7 +1354,11 @@ mod tests {
     #[tokio::test]
     async fn test_should_cretry_epoch_bump_if_manifest_version_exists() {
         let os = Arc::new(InMemory::new());
-        let ms = Arc::new(ManifestStore::new(&Path::from(ROOT), os.clone()));
+        let ms = Arc::new(ManifestStore::new(
+            &Path::from(ROOT),
+            os.clone(),
+            Arc::new(DefaultSystemClock::default()),
+        ));
         let state = CoreDbState::new();
 
         // Mimic two writers A and B that try to bump the epoch at the same time

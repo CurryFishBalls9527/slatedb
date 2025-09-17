@@ -9,7 +9,7 @@ use futures::{future::join_all, StreamExt};
 use log::{debug, warn};
 use object_store::buffered::BufWriter;
 use object_store::path::Path;
-use object_store::{ObjectStore, PutMode, PutOptions, PutPayload};
+use object_store::{ObjectStore, PutMode, PutOptions};
 use tokio::io::AsyncWriteExt;
 use ulid::Ulid;
 
@@ -198,23 +198,7 @@ impl TableStore {
         let object_store = self.object_stores.store_for(id);
         let data = encoded_sst.remaining_as_bytes();
         let path = self.path(id);
-        object_store
-            .put_opts(
-                &path,
-                PutPayload::from_bytes(data),
-                PutOptions::from(PutMode::Create),
-            )
-            .await
-            .map_err(|e| match e {
-                object_store::Error::AlreadyExists { path: _, source: _ } => match id {
-                    SsTableId::Wal(_) => {
-                        debug!("path already exists [path={}]", path);
-                        SlateDBError::Fenced
-                    }
-                    SsTableId::Compacted(_) => SlateDBError::from(e),
-                },
-                _ => SlateDBError::from(e),
-            })?;
+        write_sst_in_object_store(object_store.clone(), id, &path, &data).await?;
 
         if let Some(ref cache) = self.cache {
             if write_cache {
@@ -516,6 +500,28 @@ impl TableStore {
     }
 }
 
+async fn write_sst_in_object_store(
+    object_store: Arc<dyn ObjectStore>,
+    id: &SsTableId,
+    path: &Path,
+    data: &Bytes,
+) -> Result<(), SlateDBError> {
+    object_store
+        .put_opts(path, data.clone().into(), PutOptions::from(PutMode::Create))
+        .await
+        .map_err(|e| match e {
+            object_store::Error::AlreadyExists { path: _, source: _ } => match id {
+                SsTableId::Wal(_) => {
+                    debug!("path already exists [path={}]", path);
+                    SlateDBError::Fenced
+                }
+                SsTableId::Compacted(_) => SlateDBError::from(e),
+            },
+            _ => SlateDBError::from(e),
+        })?;
+    Ok(())
+}
+
 pub(crate) struct EncodedSsTableWriter<'a> {
     id: SsTableId,
     builder: EncodedSsTableBuilder<'a>,
@@ -593,10 +599,12 @@ mod tests {
     use crate::db_cache::{DbCache, DbCacheWrapper};
     use crate::error;
     use crate::object_stores::ObjectStores;
+    use crate::retrying_object_store::RetryingObjectStore;
     use crate::sst::SsTableFormat;
     use crate::sst_iter::{SstIterator, SstIteratorOptions};
     use crate::stats::StatRegistry;
     use crate::tablestore::TableStore;
+    use crate::test_utils::FlakyObjectStore;
     use crate::test_utils::{assert_iterator, build_test_sst};
     use crate::types::{RowEntry, ValueDeletable};
     use crate::{
@@ -1191,6 +1199,42 @@ mod tests {
         } else {
             assert_eq!(count_ssts_in(&main_store).await, 3);
         }
+    }
+
+    #[tokio::test]
+    async fn test_retry_write_sst_on_timeout_and_verify_bytes() {
+        // Given a flaky store that times out on the first put_opts
+        let base: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
+        let flaky = Arc::new(FlakyObjectStore::new(base.clone(), 1));
+        let retrying = Arc::new(RetryingObjectStore::new(flaky.clone()));
+
+        let format = SsTableFormat {
+            block_size: 64,
+            min_filter_keys: 1,
+            ..SsTableFormat::default()
+        };
+        let ts = Arc::new(TableStore::new(
+            ObjectStores::new(retrying, None),
+            format.clone(),
+            Path::from(ROOT),
+            None,
+        ));
+
+        // Build an SST and compute expected bytes
+        let id = SsTableId::Compacted(ulid::Ulid::new());
+        let sst = build_test_sst(&format, 3);
+        let expected_bytes = sst.remaining_as_bytes();
+
+        // When writing via TableStore (should retry once)
+        ts.write_sst(&id, sst, false).await.unwrap();
+
+        // Then: a retry happened
+        assert!(flaky.put_attempts() >= 2);
+
+        // And: the stored file bytes match exactly
+        let path = ts.path(&id);
+        let actual = base.get(&path).await.unwrap().bytes().await.unwrap();
+        assert_eq!(actual, expected_bytes);
     }
 
     #[rstest]

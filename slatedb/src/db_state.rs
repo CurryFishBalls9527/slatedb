@@ -78,7 +78,7 @@ impl SsTableHandle {
             );
             effective_range = effective_range
                 .intersect(visible_range)
-                .expect("An interesction of visible and physical range must be non-empty.")
+                .expect("An intersection of visible and physical range must be non-empty.")
         }
         SsTableHandle {
             id,
@@ -443,6 +443,10 @@ impl DbState {
 
     pub fn record_fatal_error(&mut self, error: SlateDBError) {
         self.error.write(error);
+    }
+
+    pub(crate) fn error(&self) -> WatchableOnceCell<SlateDBError> {
+        self.error.clone()
     }
 
     pub fn memtable(&self) -> &WritableKVTable {

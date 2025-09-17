@@ -308,7 +308,6 @@ impl WalBufferManager {
         mut quit_rx: WatchableOnceCellReader<Result<(), SlateDBError>>,
         max_flush_interval: Option<Duration>,
     ) -> Result<(), SlateDBError> {
-        let mut contiguous_failures_count = 0;
         loop {
             let mut flush_interval_fut: Pin<Box<dyn Future<Output = ()> + Send>> =
                 match max_flush_interval {
@@ -316,7 +315,7 @@ impl WalBufferManager {
                     None => Box::pin(std::future::pending()),
                 };
 
-            let result = select! {
+            select! {
                 work = work_rx.recv() => {
                     let result_tx = match work {
                         None => break,
@@ -339,22 +338,7 @@ impl WalBufferManager {
                 _ = &mut flush_interval_fut => {
                     self.do_flush().await
                 }
-            };
-
-            // not all the flush error is fatal. on temporary network errors, we can retry later.
-            // After a few continuous failures, we'll return the error, and set it as fatal error
-            // in cleanup.
-            match result {
-                Ok(_) => {
-                    contiguous_failures_count = 0;
-                }
-                Err(e) => {
-                    contiguous_failures_count += 1;
-                    if contiguous_failures_count > 3 {
-                        return Err(e);
-                    }
-                }
-            }
+            }?;
         }
 
         Ok(())
@@ -461,7 +445,7 @@ impl WalBufferManager {
     }
 
     /// Track the last applied sequence number. It's called when some WAL entries are applied to the memtable.
-    /// This infomation of the last applied seq is used to determine if the immutable wals can be recycled.
+    /// This information of the last applied seq is used to determine if the immutable wals can be recycled.
     ///
     /// It's the caller's duty to ensure the seq is monotonically increasing.
     pub async fn track_last_applied_seq(&self, seq: u64) {
@@ -662,11 +646,6 @@ mod tests {
 
         // Wait for background flush
         assert_eq!(wal_buffer.recent_flushed_wal_id(), 10);
-    }
-
-    #[tokio::test]
-    async fn test_flush_error_handling_and_retry() {
-        // TODO: use failpoint to inject hanging on flushing WAL
     }
 
     #[tokio::test]

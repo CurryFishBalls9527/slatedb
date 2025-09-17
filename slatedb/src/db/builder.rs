@@ -105,11 +105,12 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use fail_parallel::FailPointRegistry;
-use log::{info, warn};
+use log::info;
 use object_store::path::Path;
 use object_store::ObjectStore;
 use parking_lot::Mutex;
 use tokio::runtime::Handle;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use crate::admin::Admin;
@@ -133,17 +134,18 @@ use crate::db::DbInner;
 use crate::db_cache::SplitCache;
 use crate::db_cache::{DbCache, DbCacheWrapper};
 use crate::db_state::CoreDbState;
+use crate::dispatcher::MessageDispatcher;
 use crate::error::SlateDBError;
 use crate::garbage_collector::GarbageCollector;
 use crate::manifest::store::{FenceableManifest, ManifestStore, StoredManifest};
 use crate::object_stores::ObjectStores;
 use crate::paths::PathResolver;
 use crate::rand::DbRand;
+use crate::retrying_object_store::RetryingObjectStore;
 use crate::sst::SsTableFormat;
 use crate::stats::StatRegistry;
 use crate::tablestore::TableStore;
-use crate::utils::bg_task_result_into_err;
-use crate::utils::spawn_bg_task;
+use crate::utils::WatchableOnceCell;
 
 /// A builder for creating a new Db instance.
 ///
@@ -293,6 +295,11 @@ impl<P: Into<Path>> DbBuilder<P> {
         // TODO: proper URI generation, for now it works just as a flag
         let wal_object_store_uri = self.wal_object_store.as_ref().map(|_| String::new());
 
+        let retrying_main_object_store = Arc::new(RetryingObjectStore::new(self.main_object_store));
+        let retrying_wal_object_store: Option<Arc<dyn ObjectStore>> = self
+            .wal_object_store
+            .map(|s| Arc::new(RetryingObjectStore::new(s)) as Arc<dyn ObjectStore>);
+
         // Log the database opening
         if let Ok(settings_json) = self.settings.to_json_string() {
             info!(
@@ -353,7 +360,7 @@ impl<P: Into<Path>> DbBuilder<P> {
                 ));
 
                 let cached_object_store = CachedObjectStore::new(
-                    self.main_object_store.clone(),
+                    retrying_main_object_store.clone(),
                     cache_storage,
                     self.settings.object_store_cache_options.part_size_bytes,
                     self.settings.object_store_cache_options.cache_puts,
@@ -364,15 +371,16 @@ impl<P: Into<Path>> DbBuilder<P> {
             }
         };
 
-        let maybe_cached_main_object_store = match &cached_object_store {
+        let maybe_cached_main_object_store: Arc<dyn ObjectStore> = match &cached_object_store {
             Some(cached_store) => cached_store.clone(),
-            None => self.main_object_store.clone(),
+            None => retrying_main_object_store.clone(),
         };
 
         // Setup the manifest store and load latest manifest
         let manifest_store = Arc::new(ManifestStore::new(
             &path,
             maybe_cached_main_object_store.clone(),
+            system_clock.clone(),
         ));
         let latest_manifest = StoredManifest::try_load(manifest_store.clone()).await?;
 
@@ -405,7 +413,7 @@ impl<P: Into<Path>> DbBuilder<P> {
         let table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
                 maybe_cached_main_object_store.clone(),
-                self.wal_object_store.clone(),
+                retrying_wal_object_store.clone(),
             ),
             sst_format.clone(),
             path_resolver.clone(),
@@ -480,8 +488,8 @@ impl<P: Into<Path>> DbBuilder<P> {
         // Not to pollute the cache during compaction or GC
         let uncached_table_store = Arc::new(TableStore::new_with_fp_registry(
             ObjectStores::new(
-                self.main_object_store.clone(),
-                self.wal_object_store.clone(),
+                retrying_main_object_store.clone(),
+                retrying_wal_object_store.clone(),
             ),
             sst_format,
             path_resolver.clone(),
@@ -501,29 +509,19 @@ impl<P: Into<Path>> DbBuilder<P> {
             let scheduler_supplier = self
                 .compaction_scheduler_supplier
                 .unwrap_or_else(default_compaction_scheduler_supplier);
-            let cleanup_inner = inner.clone();
             let compactor = Compactor::new(
                 manifest_store.clone(),
                 uncached_table_store.clone(),
                 compactor_options.clone(),
                 scheduler_supplier,
+                compaction_handle.clone(),
                 rand.clone(),
                 inner.stat_registry.clone(),
                 system_clock.clone(),
+                inner.clone().state.read().error(),
                 self.cancellation_token.clone(),
             );
-            let compactor_task = spawn_bg_task(
-                // Spawn the main event loop on the main tokio runtime
-                &tokio_handle,
-                move |result: &Result<(), SlateDBError>| {
-                    let err = bg_task_result_into_err(result);
-                    warn!("compactor thread exited [error={}]", err);
-                    let mut state = cleanup_inner.state.write();
-                    state.record_fatal_error(err.clone())
-                },
-                // Spawn the compactor on the compaction runtime
-                async move { compactor.run_async_task(compaction_handle).await },
-            );
+            let compactor_task = tokio::spawn(async move { compactor.run_async_task().await });
             Some(compactor_task)
         } else {
             None
@@ -534,26 +532,23 @@ impl<P: Into<Path>> DbBuilder<P> {
         let garbage_collector_task =
             if self.settings.garbage_collector_options.is_some() || self.gc_runtime.is_some() {
                 let gc_options = self.settings.garbage_collector_options.unwrap_or_default();
-                let gc_handle = self.gc_runtime.unwrap_or_else(|| tokio_handle.clone());
-                let cleanup_inner = inner.clone();
                 let gc = GarbageCollector::new(
                     manifest_store.clone(),
                     uncached_table_store.clone(),
                     gc_options,
                     inner.stat_registry.clone(),
                     system_clock.clone(),
+                );
+                // Garbage collector only uses tickers, so pass in a dummy rx channel
+                let (_, rx) = mpsc::unbounded_channel();
+                let mut gc_dispatcher = MessageDispatcher::new(
+                    Box::new(gc),
+                    rx,
+                    system_clock.clone(),
                     self.cancellation_token.clone(),
+                    inner.clone().state.read().error(),
                 );
-                let garbage_collector_task = spawn_bg_task(
-                    &gc_handle,
-                    move |result| {
-                        let err = bg_task_result_into_err(result);
-                        warn!("GC thread exited [error={}]", err);
-                        let mut state = cleanup_inner.state.write();
-                        state.record_fatal_error(err.clone())
-                    },
-                    async move { gc.run_async_task().await },
-                );
+                let garbage_collector_task = tokio::spawn(async move { gc_dispatcher.run().await });
                 Some(garbage_collector_task)
             } else {
                 None
@@ -618,6 +613,7 @@ impl<P: Into<Path>> AdminBuilder<P> {
 
     /// Builds and returns an Admin instance.
     pub fn build(self) -> Admin {
+        // No retrying object stores here, since we don't want to retry admin operations
         Admin {
             path: self.path.into(),
             object_stores: ObjectStores::new(self.main_object_store, self.wal_object_store),
@@ -636,7 +632,6 @@ pub struct GarbageCollectorBuilder<P: Into<Path>> {
     wal_object_store: Option<Arc<dyn ObjectStore>>,
     options: GarbageCollectorOptions,
     stat_registry: Arc<StatRegistry>,
-    cancellation_token: CancellationToken,
     system_clock: Arc<dyn SystemClock>,
 }
 
@@ -648,7 +643,6 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             wal_object_store: None,
             options: GarbageCollectorOptions::default(),
             stat_registry: Arc::new(StatRegistry::new()),
-            cancellation_token: CancellationToken::new(),
             system_clock: Arc::new(DefaultSystemClock::default()),
         }
     }
@@ -672,12 +666,6 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
         self
     }
 
-    /// Sets the cancellation token to use for the garbage collector.
-    pub fn with_cancellation_token(mut self, cancellation_token: CancellationToken) -> Self {
-        self.cancellation_token = cancellation_token;
-        self
-    }
-
     /// Sets the WAL object store to use for the garbage collector.
     #[allow(unused)]
     pub fn with_wal_object_store(mut self, wal_object_store: Arc<dyn ObjectStore>) -> Self {
@@ -688,11 +676,19 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
     /// Builds and returns a GarbageCollector instance.
     pub fn build(self) -> GarbageCollector {
         let path: Path = self.path.into();
-        let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
+        let retrying_main_object_store = Arc::new(RetryingObjectStore::new(self.main_object_store));
+        let retrying_wal_object_store = self
+            .wal_object_store
+            .map(|s| Arc::new(RetryingObjectStore::new(s)) as Arc<dyn ObjectStore>);
+        let manifest_store = Arc::new(ManifestStore::new(
+            &path,
+            retrying_main_object_store.clone(),
+            self.system_clock.clone(),
+        ));
         let table_store = Arc::new(TableStore::new(
             ObjectStores::new(
-                self.main_object_store.clone(),
-                self.wal_object_store.clone(),
+                retrying_main_object_store.clone(),
+                retrying_wal_object_store.clone(),
             ),
             SsTableFormat::default(), // read only SSTs can use default
             path,
@@ -704,7 +700,6 @@ impl<P: Into<Path>> GarbageCollectorBuilder<P> {
             self.options,
             self.stat_registry,
             self.system_clock,
-            self.cancellation_token,
         )
     }
 }
@@ -720,8 +715,9 @@ pub struct CompactorBuilder<P: Into<Path>> {
     scheduler_supplier: Option<Arc<dyn CompactionSchedulerSupplier>>,
     rand: Arc<DbRand>,
     stat_registry: Arc<StatRegistry>,
-    cancellation_token: CancellationToken,
     system_clock: Arc<dyn SystemClock>,
+    error_state: WatchableOnceCell<SlateDBError>,
+    cancellation_token: CancellationToken,
 }
 
 #[allow(unused)]
@@ -735,8 +731,9 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             scheduler_supplier: None,
             rand: Arc::new(DbRand::default()),
             stat_registry: Arc::new(StatRegistry::new()),
-            cancellation_token: CancellationToken::new(),
             system_clock: Arc::new(DefaultSystemClock::default()),
+            error_state: WatchableOnceCell::new(),
+            cancellation_token: CancellationToken::new(),
         }
     }
 
@@ -786,12 +783,22 @@ impl<P: Into<Path>> CompactorBuilder<P> {
         self
     }
 
+    pub(crate) fn with_error_state(mut self, error_state: WatchableOnceCell<SlateDBError>) -> Self {
+        self.error_state = error_state;
+        self
+    }
+
     /// Builds and returns a Compactor instance.
     pub fn build(self) -> Compactor {
         let path: Path = self.path.into();
-        let manifest_store = Arc::new(ManifestStore::new(&path, self.main_object_store.clone()));
+        let retrying_main_object_store = Arc::new(RetryingObjectStore::new(self.main_object_store));
+        let manifest_store = Arc::new(ManifestStore::new(
+            &path,
+            retrying_main_object_store.clone(),
+            self.system_clock.clone(),
+        ));
         let table_store = Arc::new(TableStore::new(
-            ObjectStores::new(self.main_object_store.clone(), None),
+            ObjectStores::new(retrying_main_object_store.clone(), None),
             SsTableFormat::default(), // read only SSTs can use default
             path,
             None, // no need for cache in GC
@@ -806,9 +813,11 @@ impl<P: Into<Path>> CompactorBuilder<P> {
             table_store,
             self.options,
             scheduler_supplier,
+            self.tokio_handle,
             self.rand,
             self.stat_registry,
             self.system_clock,
+            self.error_state,
             self.cancellation_token,
         )
     }

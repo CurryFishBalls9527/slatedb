@@ -85,7 +85,7 @@
 //! # }
 //! ```
 
-// TODO Remove once we've migrated to MessgaeDispatcher
+// TODO Remove once we've migrated to MessageDispatcher
 #![allow(dead_code)]
 
 use std::{future::Future, pin::Pin, sync::Arc, time::Duration};
@@ -194,6 +194,7 @@ impl<T: Send + std::fmt::Debug> MessageDispatcher<T> {
     }
 
     /// Runs the dispatcher. This is the primary entry point for running the dispatcher.
+    /// Run blocks until the dispatcher is shutdown or an error occurs.
     ///
     /// [MessageDispatcher::run] is the primary entry point for running the dispatcher;
     /// it is responsible for:
@@ -393,7 +394,7 @@ pub(crate) trait MessageHandler<T: Send>: Send {
     ///
     /// ## Returns
     ///
-    /// A vector of tuples continaing the duration when a message should be sent to the
+    /// A vector of tuples containing the duration when a message should be sent to the
     /// [MessageDispatcher], and a message factory to generate a new message on each tick.
     fn tickers(&mut self) -> Vec<(Duration, Box<MessageFactory<T>>)> {
         vec![]
